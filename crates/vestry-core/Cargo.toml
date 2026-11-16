@@ -6,6 +6,11 @@ rust-version.workspace = true
 publish = false
 description = "Vestry core library: contract types, durable state, adapter, policy and supervision."
 
+[features]
+default = []
+# Test fixtures and fake adapters; never a release feature.
+test-support = []
+
 [dependencies]
 tokio.workspace = true
 rusqlite.workspace = true

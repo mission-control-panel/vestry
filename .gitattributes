@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Migration SQL bytes are canonical LF so checksums are stable (C7 rule 2).
+*.sql text eol=lf
