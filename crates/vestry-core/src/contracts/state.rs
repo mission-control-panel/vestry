@@ -269,7 +269,7 @@ pub struct RecoveryView {
     pub leases: Vec<LeaseRecord>,
     pub attempts: Vec<AttemptRecord>,
     pub dispatches: Vec<DispatchRecord>,
-    /// Added by PM decision P1-19 so Doctor can reconcile adapter sessions.
+    /// Added by PM decision P1-4 so Doctor can reconcile adapter sessions.
     pub adapter_sessions: Vec<AdapterSessionRecord>,
     pub audit_head: AuditHead,
     pub pending_outbox: Vec<OutboxRecord>,

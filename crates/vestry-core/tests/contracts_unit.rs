@@ -678,6 +678,51 @@ fn dispatch_common_rejects_unresolved_credential_and_plugin_drift() {
 }
 
 #[test]
+fn plugin_snapshot_requires_the_exact_origin_vector() {
+    let origin = |text: &str| PluginOrigin(SafeText::new(text).unwrap());
+    let verdict = |configured: Vec<PluginOrigin>, observed: Vec<PluginOrigin>| {
+        let mut binding = anchored();
+        binding.common.plugin_snapshot.configured_origins = configured;
+        binding.common.plugin_snapshot.observed_origins = observed;
+        DispatchBinding::AnchoredInvocation(binding).validate()
+    };
+
+    // Shorter observed list: a configured origin was never loaded.
+    assert!(matches!(
+        verdict(vec![origin("a"), origin("b")], vec![origin("a")]),
+        Err(DispatchBindingError::PluginSnapshotMismatch)
+    ));
+    // Longer observed list: an unexpected origin was loaded.
+    assert!(matches!(
+        verdict(vec![origin("a")], vec![origin("a"), origin("b")]),
+        Err(DispatchBindingError::PluginSnapshotMismatch)
+    ));
+    // Equal length but a different element.
+    assert!(matches!(
+        verdict(
+            vec![origin("a"), origin("b")],
+            vec![origin("a"), origin("c")]
+        ),
+        Err(DispatchBindingError::PluginSnapshotMismatch)
+    ));
+    // Equal length, same elements, different order.
+    assert!(matches!(
+        verdict(
+            vec![origin("a"), origin("b")],
+            vec![origin("b"), origin("a")]
+        ),
+        Err(DispatchBindingError::PluginSnapshotMismatch)
+    ));
+    // Identical vectors pass, including a multi-element snapshot.
+    assert!(verdict(Vec::new(), Vec::new()).is_ok());
+    assert!(verdict(
+        vec![origin("a"), origin("b")],
+        vec![origin("a"), origin("b")]
+    )
+    .is_ok());
+}
+
+#[test]
 fn canonical_bytes_are_not_json_decodable() {
     let bytes = CanonicalBytes::new(b"{}".to_vec());
     let json = serde_json::to_string(&bytes).unwrap();

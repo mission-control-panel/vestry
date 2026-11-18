@@ -369,6 +369,12 @@ pub enum ChainVerdict {
         expected: Hash32,
         found: Hash32,
     },
+    /// The event could not be canonicalized, so no hash could be computed.
+    /// This is not a hash mismatch: `expected`/`found` do not exist.
+    Unverifiable {
+        at_sequence: AuditSequence,
+        reason: CanonicalError,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -598,25 +604,51 @@ fn outcome_canon(outcome: &AuditOutcome) -> Canon<'_> {
     }
 }
 
+/// Rule 8: canonical audit arrays are ascending and unique. Duplicates are
+/// reported as `DuplicateElement` where the schema says unique; non-ascending
+/// order is `UnsortedArray`.
+fn validate_canonical_array(values: &[&str], field: &'static str) -> Result<(), CanonicalError> {
+    for (index, value) in values.iter().enumerate() {
+        if values[..index].contains(value) {
+            return Err(CanonicalError::DuplicateElement(field));
+        }
+    }
+    if !values.windows(2).all(|window| window[0] < window[1]) {
+        return Err(CanonicalError::UnsortedArray(field));
+    }
+    Ok(())
+}
+
 /// Canonical bytes of a committed event, excluding `event_hash`.
 pub fn canonical_bytes(event: &AuditEvent) -> Result<Vec<u8>, CanonicalError> {
     if event.schema_version != AUDIT_SCHEMA_VERSION {
         return Err(CanonicalError::SchemaMismatch);
     }
-    if !event.policy_refs.windows(2).all(|w| w[0] < w[1]) {
-        return Err(CanonicalError::UnsortedArray("policy_refs"));
-    }
-    if !event.evidence_refs.windows(2).all(|w| w[0] < w[1]) {
-        return Err(CanonicalError::UnsortedArray("evidence_refs"));
-    }
-    let previous_hex = event.previous_hash.to_hex();
     let policy_strings: Vec<String> = event.policy_refs.iter().map(PolicyRef::as_string).collect();
-    let gate_refs: Vec<String> = match &event.scope {
-        AuditScope::AnchoredInvocation(anchored) => anchored
-            .gate_refs
-            .iter()
-            .map(|reference| reference.0.as_str().to_owned())
-            .collect(),
+    let policy_views: Vec<&str> = policy_strings.iter().map(String::as_str).collect();
+    validate_canonical_array(&policy_views, "policy_refs")?;
+    let evidence_views: Vec<&str> = event.evidence_refs.iter().map(|id| id.as_str()).collect();
+    validate_canonical_array(&evidence_views, "evidence_refs")?;
+    let previous_hex = event.previous_hash.to_hex();
+    let gate_strings: Vec<String> = match &event.scope {
+        AuditScope::AnchoredInvocation(anchored) => {
+            let criterion_views: Vec<&str> = anchored
+                .criterion_ids
+                .iter()
+                .map(|id| id.as_str())
+                .collect();
+            if criterion_views.is_empty() {
+                return Err(CanonicalError::MissingField("criterion_ids".to_owned()));
+            }
+            validate_canonical_array(&criterion_views, "criterion_ids")?;
+            let gate_views: Vec<&str> = anchored
+                .gate_refs
+                .iter()
+                .map(|reference| reference.0.as_str())
+                .collect();
+            validate_canonical_array(&gate_views, "gate_refs")?;
+            gate_views.into_iter().map(str::to_owned).collect()
+        }
         _ => Vec::new(),
     };
 
@@ -678,7 +710,7 @@ pub fn canonical_bytes(event: &AuditEvent) -> Result<Vec<u8>, CanonicalError> {
                 ("fence", Canon::UInt(anchored.fence.get() as u128)),
                 (
                     "gate_refs",
-                    Canon::Arr(gate_refs.iter().map(|r| Canon::Str(r)).collect()),
+                    Canon::Arr(gate_strings.iter().map(|r| Canon::Str(r)).collect()),
                 ),
                 ("goal_id", Canon::Str(anchored.goal_id.as_str())),
                 ("kind", Canon::Str("anchored_invocation")),
@@ -772,10 +804,9 @@ impl AuditEvent {
                 expected,
                 found: self.event_hash,
             },
-            Err(_) => ChainVerdict::EventHashMismatch {
+            Err(reason) => ChainVerdict::Unverifiable {
                 at_sequence: self.sequence,
-                expected: self.event_hash,
-                found: self.event_hash,
+                reason,
             },
         }
     }
@@ -815,8 +846,9 @@ pub fn verify_chain(events: &[AuditEvent], trusted_head: Option<AuditHead>) -> C
                 };
             }
         }
-        if let ChainVerdict::EventHashMismatch { .. } = event.verify_event_hash() {
-            return event.verify_event_hash();
+        match event.verify_event_hash() {
+            ChainVerdict::Valid { .. } => {}
+            verdict => return verdict,
         }
         previous = Some(event);
     }
@@ -834,10 +866,171 @@ pub fn verify_chain(events: &[AuditEvent], trusted_head: Option<AuditHead>) -> C
     }
 }
 
+/// Rule 3: a decoder that accepts duplicate JSON keys is rejected before
+/// hashing. `serde_json::Value` silently keeps the last occurrence, so the raw
+/// bytes are scanned first; a duplicate at any object depth is `DuplicateKey`.
+fn reject_duplicate_keys(input: &[u8]) -> Result<(), CanonicalError> {
+    let mut scanner = JsonScanner {
+        bytes: input,
+        position: 0,
+    };
+    scanner.skip_whitespace();
+    scanner.scan_value(0)?;
+    scanner.skip_whitespace();
+    if scanner.position != input.len() {
+        return Err(CanonicalError::InvalidJson);
+    }
+    Ok(())
+}
+
+const MAX_JSON_DEPTH: usize = 128;
+
+struct JsonScanner<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl JsonScanner<'_> {
+    fn skip_whitespace(&mut self) {
+        while matches!(
+            self.bytes.get(self.position),
+            Some(b' ' | b'\t' | b'\n' | b'\r')
+        ) {
+            self.position += 1;
+        }
+    }
+
+    fn expect(&mut self, byte: u8) -> Result<(), CanonicalError> {
+        if self.bytes.get(self.position) == Some(&byte) {
+            self.position += 1;
+            Ok(())
+        } else {
+            Err(CanonicalError::InvalidJson)
+        }
+    }
+
+    fn scan_value(&mut self, depth: usize) -> Result<(), CanonicalError> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(CanonicalError::InvalidJson);
+        }
+        match self.bytes.get(self.position) {
+            Some(b'{') => self.scan_object(depth),
+            Some(b'[') => self.scan_array(depth),
+            Some(b'"') => self.scan_string(),
+            Some(b't') => self.scan_literal(b"true"),
+            Some(b'f') => self.scan_literal(b"false"),
+            Some(b'n') => self.scan_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.scan_number(),
+            _ => Err(CanonicalError::InvalidJson),
+        }
+    }
+
+    fn scan_object(&mut self, depth: usize) -> Result<(), CanonicalError> {
+        self.position += 1;
+        let mut keys = std::collections::HashSet::new();
+        self.skip_whitespace();
+        if self.bytes.get(self.position) == Some(&b'}') {
+            self.position += 1;
+            return Ok(());
+        }
+        loop {
+            self.skip_whitespace();
+            let start = self.position;
+            self.scan_string()?;
+            let key: String = serde_json::from_slice(&self.bytes[start..self.position])
+                .map_err(|_| CanonicalError::InvalidJson)?;
+            if !keys.insert(key) {
+                return Err(CanonicalError::DuplicateKey);
+            }
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            self.scan_value(depth + 1)?;
+            self.skip_whitespace();
+            match self.bytes.get(self.position) {
+                Some(b',') => self.position += 1,
+                Some(b'}') => {
+                    self.position += 1;
+                    return Ok(());
+                }
+                _ => return Err(CanonicalError::InvalidJson),
+            }
+        }
+    }
+
+    fn scan_array(&mut self, depth: usize) -> Result<(), CanonicalError> {
+        self.position += 1;
+        self.skip_whitespace();
+        if self.bytes.get(self.position) == Some(&b']') {
+            self.position += 1;
+            return Ok(());
+        }
+        loop {
+            self.skip_whitespace();
+            self.scan_value(depth + 1)?;
+            self.skip_whitespace();
+            match self.bytes.get(self.position) {
+                Some(b',') => self.position += 1,
+                Some(b']') => {
+                    self.position += 1;
+                    return Ok(());
+                }
+                _ => return Err(CanonicalError::InvalidJson),
+            }
+        }
+    }
+
+    fn scan_string(&mut self) -> Result<(), CanonicalError> {
+        self.expect(b'"')?;
+        while let Some(&byte) = self.bytes.get(self.position) {
+            match byte {
+                b'"' => {
+                    self.position += 1;
+                    return Ok(());
+                }
+                b'\\' => {
+                    self.position += 1;
+                    if self.bytes.get(self.position).is_none() {
+                        return Err(CanonicalError::InvalidJson);
+                    }
+                    self.position += 1;
+                }
+                byte if byte < 0x20 => return Err(CanonicalError::InvalidJson),
+                _ => self.position += 1,
+            }
+        }
+        Err(CanonicalError::InvalidJson)
+    }
+
+    fn scan_literal(&mut self, literal: &[u8]) -> Result<(), CanonicalError> {
+        if self.bytes[self.position..].starts_with(literal) {
+            self.position += literal.len();
+            Ok(())
+        } else {
+            Err(CanonicalError::InvalidJson)
+        }
+    }
+
+    fn scan_number(&mut self) -> Result<(), CanonicalError> {
+        let start = self.position;
+        while matches!(
+            self.bytes.get(self.position),
+            Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+        ) {
+            self.position += 1;
+        }
+        if self.position == start {
+            return Err(CanonicalError::InvalidJson);
+        }
+        Ok(())
+    }
+}
+
 /// Decodes raw JSON into canonical bytes, enforcing every C5 rule. Used to
-/// prove rejection of floats, nulls, control characters and an `event_hash`
-/// member; the typed encoder is the audit path.
+/// prove rejection of floats, nulls, control characters, duplicate keys and an
+/// `event_hash` member; the typed encoder is the audit path.
 pub fn canonicalize_json_bytes(input: &[u8]) -> Result<Vec<u8>, CanonicalError> {
+    reject_duplicate_keys(input)?;
     let value: serde_json::Value =
         serde_json::from_slice(input).map_err(|_| CanonicalError::InvalidJson)?;
     if let serde_json::Value::Object(map) = &value {

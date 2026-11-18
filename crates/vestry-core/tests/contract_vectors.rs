@@ -221,6 +221,165 @@ fn audit_domain_separation_changes_digest() {
 }
 
 #[test]
+fn canonical_arrays_must_be_sorted_and_unique() {
+    fn anchored_scope(event: &mut AuditEvent) -> &mut AnchoredInvocationScope {
+        match &mut event.scope {
+            AuditScope::AnchoredInvocation(scope) => scope,
+            _ => panic!("vector B is an anchored invocation"),
+        }
+    }
+    let gate = |text: &str| AuditGateRef(SafeCode::new(text).unwrap());
+    let criterion = |text: &str| CriterionId::new(text).unwrap();
+
+    let mut unsorted_gates = vector_b();
+    anchored_scope(&mut unsorted_gates).gate_refs.reverse();
+    assert_eq!(
+        canonical_bytes(&unsorted_gates),
+        Err(CanonicalError::UnsortedArray("gate_refs"))
+    );
+
+    let mut duplicate_gates = vector_b();
+    let repeated = gate("gate:1:rev7");
+    anchored_scope(&mut duplicate_gates).gate_refs = vec![repeated.clone(), repeated];
+    assert_eq!(
+        canonical_bytes(&duplicate_gates),
+        Err(CanonicalError::DuplicateElement("gate_refs"))
+    );
+
+    let mut unsorted_criteria = vector_b();
+    anchored_scope(&mut unsorted_criteria).criterion_ids =
+        vec![criterion("crit_02"), criterion("crit_01")];
+    assert_eq!(
+        canonical_bytes(&unsorted_criteria),
+        Err(CanonicalError::UnsortedArray("criterion_ids"))
+    );
+
+    let mut duplicate_criteria = vector_b();
+    anchored_scope(&mut duplicate_criteria).criterion_ids =
+        vec![criterion("crit_01"), criterion("crit_01")];
+    assert_eq!(
+        canonical_bytes(&duplicate_criteria),
+        Err(CanonicalError::DuplicateElement("criterion_ids"))
+    );
+
+    let mut empty_criteria = vector_b();
+    anchored_scope(&mut empty_criteria).criterion_ids.clear();
+    assert_eq!(
+        canonical_bytes(&empty_criteria),
+        Err(CanonicalError::MissingField("criterion_ids".to_owned()))
+    );
+
+    let mut unsorted_policy = vector_a();
+    unsorted_policy.policy_refs = vec![
+        PolicyRef::revision(PolicyRevision(8)),
+        PolicyRef::revision(PolicyRevision(7)),
+    ];
+    assert_eq!(
+        canonical_bytes(&unsorted_policy),
+        Err(CanonicalError::UnsortedArray("policy_refs"))
+    );
+
+    let mut duplicate_policy = vector_a();
+    duplicate_policy.policy_refs = vec![
+        PolicyRef::revision(PolicyRevision(7)),
+        PolicyRef::revision(PolicyRevision(7)),
+    ];
+    assert_eq!(
+        canonical_bytes(&duplicate_policy),
+        Err(CanonicalError::DuplicateElement("policy_refs"))
+    );
+
+    let mut unsorted_evidence = vector_a();
+    unsorted_evidence.evidence_refs = vec![
+        EvidenceId::new("ev_02").unwrap(),
+        EvidenceId::new("ev_01").unwrap(),
+    ];
+    assert_eq!(
+        canonical_bytes(&unsorted_evidence),
+        Err(CanonicalError::UnsortedArray("evidence_refs"))
+    );
+
+    let mut duplicate_evidence = vector_a();
+    duplicate_evidence.evidence_refs = vec![
+        EvidenceId::new("ev_01").unwrap(),
+        EvidenceId::new("ev_01").unwrap(),
+    ];
+    assert_eq!(
+        canonical_bytes(&duplicate_evidence),
+        Err(CanonicalError::DuplicateElement("evidence_refs"))
+    );
+
+    // The frozen vectors remain canonical and byte-identical.
+    assert!(canonical_bytes(&vector_a()).is_ok());
+    assert!(canonical_bytes(&vector_b()).is_ok());
+}
+
+#[test]
+fn canonicalize_rejects_duplicate_json_keys_at_any_depth() {
+    let top_level = br#"{"sequence":1,"sequence":2,"previous_hash":"x","schema_version":1,"actor":{},"action":{},"scope":{},"policy_refs":[],"evidence_refs":[],"outcome":{},"recorded_at_ms":1}"#;
+    assert_eq!(
+        canonicalize_json_bytes(top_level),
+        Err(CanonicalError::DuplicateKey)
+    );
+
+    let nested = br#"{"sequence":1,"previous_hash":"x","schema_version":1,"actor":{"kind":"supervisor","generation":7,"generation":8},"action":{},"scope":{},"policy_refs":[],"evidence_refs":[],"outcome":{},"recorded_at_ms":1}"#;
+    assert_eq!(
+        canonicalize_json_bytes(nested),
+        Err(CanonicalError::DuplicateKey)
+    );
+
+    let deep = br#"{"sequence":1,"previous_hash":"x","schema_version":1,"actor":{},"action":{},"scope":{"k":{"inner":{"x":1,"x":2}}},"policy_refs":[],"evidence_refs":[],"outcome":{},"recorded_at_ms":1}"#;
+    assert_eq!(
+        canonicalize_json_bytes(deep),
+        Err(CanonicalError::DuplicateKey)
+    );
+
+    // No duplicate keys: the same input still canonicalizes.
+    let clean = br#"{"sequence":1,"previous_hash":"x","schema_version":1,"actor":{},"action":{},"scope":{},"policy_refs":[],"evidence_refs":[],"outcome":{},"recorded_at_ms":1}"#;
+    assert!(canonicalize_json_bytes(clean).is_ok());
+}
+
+#[test]
+fn canonicalization_failure_is_distinguishable_from_hash_mismatch() {
+    let mut unsorted = vector_b();
+    if let AuditScope::AnchoredInvocation(scope) = &mut unsorted.scope {
+        scope.gate_refs.reverse();
+    }
+    // The stored hash is the correct hash of the well-ordered event, so a
+    // masking implementation would report EventHashMismatch.
+    unsorted.event_hash = compute_event_hash(&vector_b()).unwrap();
+    match unsorted.verify_event_hash() {
+        ChainVerdict::Unverifiable {
+            at_sequence,
+            reason,
+        } => {
+            assert_eq!(at_sequence, AuditSequence(2));
+            assert_eq!(reason, CanonicalError::UnsortedArray("gate_refs"));
+        }
+        other => panic!("expected Unverifiable, got {other:?}"),
+    }
+
+    let mut tampered = vector_b();
+    tampered.event_hash = Hash32::from_hex(HASH_A).unwrap();
+    match tampered.verify_event_hash() {
+        ChainVerdict::EventHashMismatch {
+            expected, found, ..
+        } => assert_ne!(expected, found),
+        other => panic!("expected EventHashMismatch, got {other:?}"),
+    }
+
+    // The chain propagates the distinguishable verdict, not a mismatch.
+    let mut a = vector_a();
+    a.event_hash = compute_event_hash(&a).unwrap();
+    let mut c = vector_c();
+    c.event_hash = compute_event_hash(&c).unwrap();
+    assert!(matches!(
+        verify_chain(&[a, unsorted, c], None),
+        ChainVerdict::Unverifiable { .. }
+    ));
+}
+
+#[test]
 fn canonical_rules_reject_float_null_control_and_hash_field() {
     let float = br#"{"sequence":1,"previous_hash":"x","schema_version":1,"actor":{},"action":{},"scope":{},"policy_refs":[],"evidence_refs":[],"outcome":{},"recorded_at_ms":1.5}"#;
     assert_eq!(

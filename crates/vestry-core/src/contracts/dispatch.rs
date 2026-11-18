@@ -192,13 +192,9 @@ impl DispatchCommon {
         self.config_bytes.validate()?;
         self.policy_bytes.validate()?;
         self.model_pin.validate()?;
-        if self
-            .plugin_snapshot
-            .configured_origins
-            .iter()
-            .zip(self.plugin_snapshot.observed_origins.iter())
-            .any(|(configured, observed)| configured != observed)
-        {
+        // §4.4 requires a complete snapshot: unequal lengths, reordering and
+        // substitution are all drift. `zip` would silently truncate.
+        if self.plugin_snapshot.configured_origins != self.plugin_snapshot.observed_origins {
             return Err(DispatchBindingError::PluginSnapshotMismatch);
         }
         if let Some(credential) = self.model_pin.credential_ref.as_ref() {

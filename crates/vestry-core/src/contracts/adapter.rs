@@ -15,7 +15,6 @@ use super::primitives::{
     AttemptId, CanaryId, ConditionId, EvidenceId, ManifestId, MessageId, PartId, RedactionVersion,
     SafeCode, SafeText, SessionId, Sha256Digest, SnapshotRef, UtcMillis,
 };
-use crate::safe_text_newtype;
 
 // ---------------------------------------------------------------------------
 // Capability state and manifest (C3 §4.1)
@@ -867,6 +866,3 @@ pub enum InboxSource {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct InboxKey(pub SafeCode);
-
-// Free-form identifier used by the intake summary; kept opaque and safe.
-safe_text_newtype!(IntakeTarget);
