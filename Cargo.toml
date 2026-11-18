@@ -38,6 +38,9 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    # S1 amendment: LockFileEx/CreateFileW and OVERLAPPED (PM decision D1).
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
 ] }
 # Test-only temporary directories and files.
 tempfile = "3"

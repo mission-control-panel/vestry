@@ -19,6 +19,7 @@ pub mod audit;
 pub mod canary;
 pub mod contracts;
 pub mod daemon;
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake_adapter;
 pub mod ndjson;
 pub mod pin;
