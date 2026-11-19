@@ -47,20 +47,36 @@ use super::contracts::state::{
     StateReply, StateTarget, StateTxn, StateWriter,
 };
 use super::contracts::status::{
-    AttemptState, DaemonGenerationState, DispatchState, ProcessObservedState, SafeArtifactRef,
-    TaskState,
+    AttemptState, DaemonGenerationState, DispatchState, EvidenceIntegrity, EvidenceType,
+    ProcessObservedState, SafeArtifactRef, TaskState,
 };
 
 /// Embedded migration train. The digest is computed over the exact bytes of
 /// the file as checked into git (`*.sql text eol=lf`, Q9).
 const MIGRATIONS: &[(u32, &[u8])] = &[(1, include_bytes!("../migrations/0001_v1.sql"))];
 
+/// Persisted JSON form of the only terminal approval state.
+const CONSUMED_APPROVAL_STATE: &str = "\"consumed\"";
+
+/// `schema_migrations` is insert-only (C7 §8.3.5 / §8.4): applied history is
+/// never rewritten in place. The triggers are runner-owned so the migration
+/// bytes (and therefore the checksum) stay exactly the DDL train.
 const SCHEMA_MIGRATIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     checksum TEXT NOT NULL,
     applied_at_ms INTEGER NOT NULL,
     binary_revision TEXT NOT NULL
-)";
+);
+CREATE TRIGGER IF NOT EXISTS schema_migrations_no_update
+BEFORE UPDATE ON schema_migrations
+BEGIN
+    SELECT RAISE(ABORT, 'schema_migrations is insert-only');
+END;
+CREATE TRIGGER IF NOT EXISTS schema_migrations_no_delete
+BEFORE DELETE ON schema_migrations
+BEGIN
+    SELECT RAISE(ABORT, 'schema_migrations is insert-only');
+END;";
 
 /// Builder revision persisted with each applied migration. It identifies the
 /// binary that produced the DDL; it is not a security boundary.
@@ -106,6 +122,10 @@ pub struct SqliteStateStore {
 impl SqliteStateStore {
     /// Opens (creating if absent) the database at `path`, applies the
     /// migration train, and starts the writer thread.
+    ///
+    /// This function is synchronous and runs SQLite on the calling thread.
+    /// Per D4 it must be called off the Tokio executor (the composition root
+    /// wraps it in `spawn_blocking`); enforcement lands with B2.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -283,7 +303,33 @@ fn configure(connection: &Connection) -> Result<(), StateError> {
              PRAGMA foreign_keys=ON;
              PRAGMA busy_timeout=5000;",
         )
-        .map_err(db_error)
+        .map_err(db_error)?;
+    // C7 §8.3.8/§8.4: the settings must be *read back*, not assumed. A
+    // mismatch fails closed before any migration or write can proceed.
+    verify_pragmas(connection)
+}
+
+fn verify_pragmas(connection: &Connection) -> Result<(), StateError> {
+    let journal: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(db_error)?;
+    if !journal.eq_ignore_ascii_case("wal") {
+        return Err(internal(InternalErrorCode::Invariant));
+    }
+    // `PRAGMA synchronous` reports the numeric level; FULL is 2.
+    let synchronous: i64 = connection
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .map_err(db_error)?;
+    if synchronous != 2 {
+        return Err(internal(InternalErrorCode::Invariant));
+    }
+    let foreign_keys: i64 = connection
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .map_err(db_error)?;
+    if foreign_keys != 1 {
+        return Err(internal(InternalErrorCode::Invariant));
+    }
+    Ok(())
 }
 
 fn writer_loop(mut connection: Connection, mut receiver: mpsc::Receiver<Command>) {
@@ -423,14 +469,32 @@ fn migrate(connection: &mut Connection) -> Result<(), StateError> {
         tx.commit().map_err(db_error)?;
     }
 
+    // C7 §8.3.4/§8.4 startup verification. These are returning checks, not
+    // `debug_assert`s: release builds must enforce them just as strictly.
     let present = table_names(connection)?;
-    debug_assert_eq!(present.len(), EXPECTED_TABLE_COUNT);
-    for expected in TABLE_NAMES {
-        debug_assert!(
-            present.iter().any(|name| name == expected),
-            "migration train is missing table {expected}"
-        );
+    if present.len() != EXPECTED_TABLE_COUNT {
+        return Err(internal(InternalErrorCode::Invariant));
     }
+    for expected in TABLE_NAMES {
+        if !present.iter().any(|name| name == expected) {
+            return Err(internal(InternalErrorCode::Invariant));
+        }
+    }
+    let fk_violations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .map_err(db_error)?;
+    if fk_violations != 0 {
+        return Err(internal(InternalErrorCode::Invariant));
+    }
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(db_error)?;
+    if integrity != "ok" {
+        return Err(internal(InternalErrorCode::Invariant));
+    }
+    verify_pragmas(connection)?;
     Ok(())
 }
 
@@ -464,6 +528,8 @@ fn commit(connection: &mut Connection, txn: &StateTxn) -> Result<CommitReceipt, 
         revisions.push(apply_mutation(&transaction, txn, mutation)?);
     }
 
+    validate_termination_proofs(&transaction, txn)?;
+
     let committed_at_ms = now_ms();
     let head = audit_runtime::current_head(&transaction)?;
     let appended = audit_runtime::append(&transaction, txn.audit(), head, committed_at_ms)?;
@@ -484,6 +550,92 @@ fn commit(connection: &mut Connection, txn: &StateTxn) -> Result<CommitReceipt, 
     })
 }
 
+/// D5 / T45 §10.5: a recorded termination proof is only authoritative when
+/// its evidence row commits in the same transaction, an audit event references
+/// it, and the target owned process is the one the proof names. Otherwise the
+/// whole transaction rolls back; no `Terminated` claim survives without its
+/// authority chain.
+fn validate_termination_proofs(
+    transaction: &Transaction<'_>,
+    txn: &StateTxn,
+) -> Result<(), StateError> {
+    for mutation in txn.mutations() {
+        let StateOp::RecordTerminationProof { proof } = &mutation.op else {
+            continue;
+        };
+        let StateTarget::OwnedProcess(record_id) = &mutation.target else {
+            return Err(StateError::ConstraintViolation {
+                constraint: "termination_proof_target",
+            });
+        };
+        let evidence = txn
+            .mutations()
+            .iter()
+            .find_map(|candidate| match (&candidate.op, &candidate.target) {
+                (StateOp::InsertEvidence { evidence }, StateTarget::Evidence(id))
+                    if *id == proof.evidence_id =>
+                {
+                    Some(evidence)
+                }
+                _ => None,
+            })
+            .ok_or(StateError::ConstraintViolation {
+                constraint: "termination_proof_evidence",
+            })?;
+        if txn.audit().is_empty() {
+            return Err(StateError::ConstraintViolation {
+                constraint: "termination_proof_audit",
+            });
+        }
+        if evidence.evidence_type != EvidenceType::TerminationProof
+            || evidence.redaction_version != proof.redaction_version
+        {
+            return Err(StateError::ConstraintViolation {
+                constraint: "termination_proof_evidence",
+            });
+        }
+        // Only `Verified` may support a PASS; an incomplete/unavailable proof
+        // is `Unavailable` and can never claim termination (T45 C10.5).
+        let expected_integrity = if proof.is_complete() {
+            EvidenceIntegrity::Verified
+        } else {
+            EvidenceIntegrity::Unavailable
+        };
+        if evidence.integrity != expected_integrity {
+            return Err(StateError::ConstraintViolation {
+                constraint: "termination_proof_integrity",
+            });
+        }
+        let binding: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT o.dispatch_id, d.attempt_id
+                 FROM owned_processes o
+                 JOIN dispatches d ON d.dispatch_id = o.dispatch_id
+                 WHERE o.process_record_id = ?1",
+                params![record_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        match binding {
+            Some((dispatch, attempt))
+                if dispatch == proof.dispatch_id.as_str()
+                    && attempt == proof.attempt_id.as_str() => {}
+            Some(_) => {
+                return Err(StateError::ConstraintViolation {
+                    constraint: "termination_proof_dispatch",
+                })
+            }
+            None => {
+                return Err(StateError::NotFound {
+                    target: mutation.target.clone(),
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
 fn enforce_generation(transaction: &Transaction<'_>, txn: &StateTxn) -> Result<(), StateError> {
     let current: Option<u64> = transaction
         .query_row(
@@ -500,14 +652,36 @@ fn enforce_generation(transaction: &Transaction<'_>, txn: &StateTxn) -> Result<(
         .iter()
         .any(|mutation| matches!(mutation.op, StateOp::BeginDaemonGeneration { .. }));
 
-    match current {
-        Some(current) if DaemonGeneration(current) != txn.generation() => {
+    // T45 §10.1: a restart acquires the *next* generation (clean or unclean
+    // prior shutdown alike); every other operation must target the current
+    // one. A begin at the current generation is a duplicate, not a restart.
+    match (current, begins) {
+        (Some(current), true) => {
+            let next = current
+                .checked_add(1)
+                .map(DaemonGeneration)
+                .ok_or_else(|| internal(InternalErrorCode::Invariant))?;
+            if txn.generation() != next {
+                return Err(StateError::NotCurrentGeneration {
+                    expected: next,
+                    found: txn.generation(),
+                });
+            }
+            Ok(())
+        }
+        (Some(current), false) if DaemonGeneration(current) != txn.generation() => {
             Err(StateError::NotCurrentGeneration {
                 expected: DaemonGeneration(current),
                 found: txn.generation(),
             })
         }
-        None if !begins => Err(StateError::NotCurrentGeneration {
+        (None, true) if txn.generation() != DaemonGeneration(1) => {
+            Err(StateError::NotCurrentGeneration {
+                expected: DaemonGeneration(1),
+                found: txn.generation(),
+            })
+        }
+        (None, false) => Err(StateError::NotCurrentGeneration {
             expected: DaemonGeneration(0),
             found: txn.generation(),
         }),
@@ -555,7 +729,12 @@ fn apply_mutation(
         }
 
         (StateOp::MarkCleanShutdown { .. }, StateTarget::DaemonGeneration) => {
-            let current = require_revision(transaction, target, mutation.expected_revision)?;
+            let current = require_revision(
+                transaction,
+                target,
+                mutation.expected_revision,
+                txn.generation(),
+            )?;
             let revision = current.next();
             let changed = transaction
                 .execute(
@@ -601,13 +780,21 @@ fn apply_mutation(
                     params![attempt_id.as_str(), json(&AttemptState::LaunchIntent)?],
                 )
                 .map_err(db_error)?;
+            // The frozen op carries no ordinal input; T45 fixes the first
+            // dispatch of an attempt at `DispatchOrdinal(1)`. A second
+            // dispatch per attempt is a recorded B1.2 limitation
+            // (`UNIQUE(attempt_id, ordinal)`).
+            let insert_dispatch = format!(
+                "INSERT INTO dispatches
+                     (dispatch_id, attempt_id, ordinal, binding_kind, state, session_id,
+                      admission_id, manifest_id, canary_id, lease_id, fence, intent_state,
+                      created_at_ms, revision)
+                 VALUES (?1, ?2, {}, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
+                DispatchOrdinal::FIRST.get()
+            );
             transaction
                 .execute(
-                    "INSERT INTO dispatches
-                         (dispatch_id, attempt_id, ordinal, binding_kind, state, session_id,
-                          admission_id, manifest_id, canary_id, lease_id, fence, intent_state,
-                          created_at_ms, revision)
-                     VALUES (?1, ?2, 0, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
+                    &insert_dispatch,
                     params![
                         dispatch_id.as_str(),
                         attempt_id.as_str(),
@@ -623,6 +810,14 @@ fn apply_mutation(
                     ],
                 )
                 .map_err(|error| map_constraint(error, "dispatches"))?;
+            // F10: the attempt points at its current dispatch so
+            // `AttemptView.active_dispatch` is not permanently empty.
+            transaction
+                .execute(
+                    "UPDATE attempts SET active_dispatch_id = ?2 WHERE attempt_id = ?1",
+                    params![attempt_id.as_str(), dispatch_id.as_str()],
+                )
+                .map_err(db_error)?;
             Ok(ObjectRevision {
                 target: target.clone(),
                 revision: Revision::INITIAL,
@@ -640,18 +835,31 @@ fn apply_mutation(
             StateTarget::OwnedProcess(_),
         ) => {
             let record_id = process_record_id(target)?;
-            let exists: Option<i64> = transaction
+            // R5: the dispatch may already be bound to a different process
+            // record id. Silently retargeting it would rewrite ownership and
+            // regress the stored revision, so the id must match.
+            let bound: Option<String> = transaction
                 .query_row(
-                    "SELECT 1 FROM owned_processes WHERE process_record_id = ?1",
-                    params![record_id.as_str()],
+                    "SELECT process_record_id FROM owned_processes WHERE dispatch_id = ?1",
+                    params![dispatch_id.as_str()],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(db_error)?;
-            let revision = if exists.is_some() {
-                require_revision(transaction, target, mutation.expected_revision)?.next()
-            } else {
-                match mutation.expected_revision {
+            let revision = match bound.as_deref() {
+                Some(stored) if stored != record_id.as_str() => {
+                    return Err(StateError::ConstraintViolation {
+                        constraint: "owned_processes_process_record_id",
+                    })
+                }
+                Some(_) => require_revision(
+                    transaction,
+                    target,
+                    mutation.expected_revision,
+                    txn.generation(),
+                )?
+                .next(),
+                None => match mutation.expected_revision {
                     Some(expected) => {
                         return Err(StateError::Conflict {
                             target: target.clone(),
@@ -660,7 +868,7 @@ fn apply_mutation(
                         })
                     }
                     None => Revision::INITIAL,
-                }
+                },
             };
             transaction
                 .execute(
@@ -695,7 +903,12 @@ fn apply_mutation(
         }
 
         (StateOp::UpdateOwnedProcessState { observed_state }, StateTarget::OwnedProcess(_)) => {
-            let current = require_revision(transaction, target, mutation.expected_revision)?;
+            let current = require_revision(
+                transaction,
+                target,
+                mutation.expected_revision,
+                txn.generation(),
+            )?;
             let revision = current.next();
             let changed = transaction
                 .execute(
@@ -740,8 +953,13 @@ fn apply_mutation(
                     to: attempt_label(*to),
                 });
             }
-            let revision =
-                require_revision(transaction, target, mutation.expected_revision)?.next();
+            let revision = require_revision(
+                transaction,
+                target,
+                mutation.expected_revision,
+                txn.generation(),
+            )?
+            .next();
             transaction
                 .execute(
                     "UPDATE attempts SET state = ?2, revision = ?3 WHERE attempt_id = ?1",
@@ -775,8 +993,13 @@ fn apply_mutation(
                     to: dispatch_label(*to),
                 });
             }
-            let revision =
-                require_revision(transaction, target, mutation.expected_revision)?.next();
+            let revision = require_revision(
+                transaction,
+                target,
+                mutation.expected_revision,
+                txn.generation(),
+            )?
+            .next();
             transaction
                 .execute(
                     "UPDATE dispatches SET state = ?2, revision = ?3 WHERE dispatch_id = ?1",
@@ -810,8 +1033,13 @@ fn apply_mutation(
                     to: task_label(*to),
                 });
             }
-            let revision =
-                require_revision(transaction, target, mutation.expected_revision)?.next();
+            let revision = require_revision(
+                transaction,
+                target,
+                mutation.expected_revision,
+                txn.generation(),
+            )?
+            .next();
             transaction
                 .execute(
                     "UPDATE tasks SET state = ?2, revision = ?3 WHERE task_id = ?1",
@@ -825,8 +1053,13 @@ fn apply_mutation(
         }
 
         (StateOp::ParkRecoveryRequired { reason, finding }, StateTarget::Attempt(attempt_id)) => {
-            let revision =
-                require_revision(transaction, target, mutation.expected_revision)?.next();
+            let revision = require_revision(
+                transaction,
+                target,
+                mutation.expected_revision,
+                txn.generation(),
+            )?
+            .next();
             let changed = transaction
                 .execute(
                     "UPDATE attempts
@@ -871,7 +1104,7 @@ fn apply_mutation(
                         evidence.revision.get() as i64,
                         evidence.redaction_version.get() as i64,
                         json(&evidence.integrity)?,
-                        now_ms().0,
+                        evidence.created_at_ms.0,
                     ],
                 )
                 .map_err(|error| map_constraint(error, "evidence"))?;
@@ -906,8 +1139,13 @@ fn apply_mutation(
             } else {
                 ProcessObservedState::RecoveryRequired
             };
-            let revision =
-                require_revision(transaction, target, mutation.expected_revision)?.next();
+            let revision = require_revision(
+                transaction,
+                target,
+                mutation.expected_revision,
+                txn.generation(),
+            )?
+            .next();
             transaction
                 .execute(
                     "UPDATE owned_processes SET observed_state = ?2, revision = ?3
@@ -924,29 +1162,69 @@ fn apply_mutation(
         (
             StateOp::ConsumeGrant {
                 approval_id,
+                action_id,
                 consumed_at_ms,
-                ..
             },
             StateTarget::Approval(target_id),
         ) if target_id == approval_id => {
-            let revision =
-                require_revision(transaction, target, mutation.expected_revision)?.next();
+            let stored: Option<(Option<String>, String, Option<i64>)> = transaction
+                .query_row(
+                    "SELECT action_id, state, expires_at_ms FROM approvals
+                     WHERE approval_id = ?1",
+                    params![approval_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(db_error)?;
+            let Some((stored_action, stored_state, expires_at_ms)) = stored else {
+                return Err(StateError::NotFound {
+                    target: target.clone(),
+                });
+            };
+            // LLD 95/101/142: a grant is bound to one action, expires and is
+            // single-use.
+            if stored_action.as_deref() != Some(action_id.as_str()) {
+                return Err(StateError::ConstraintViolation {
+                    constraint: "approval_action_id",
+                });
+            }
+            if stored_state == CONSUMED_APPROVAL_STATE {
+                return Err(StateError::InvalidTransition {
+                    from: "consumed",
+                    to: "consumed",
+                });
+            }
+            if expires_at_ms.is_some_and(|expiry| expiry <= consumed_at_ms.0) {
+                return Err(StateError::InvalidTransition {
+                    from: "expired",
+                    to: "consumed",
+                });
+            }
+            let revision = require_revision(
+                transaction,
+                target,
+                mutation.expected_revision,
+                txn.generation(),
+            )?
+            .next();
             let changed = transaction
                 .execute(
                     "UPDATE approvals
-                     SET state = '\"consumed\"', consumed_at_ms = ?2, revision = ?3
-                     WHERE approval_id = ?1",
+                     SET state = ?4, consumed_at_ms = ?2, revision = ?5
+                     WHERE approval_id = ?1 AND action_id = ?3
+                       AND state <> ?4
+                       AND (expires_at_ms IS NULL OR expires_at_ms > ?2)",
                     params![
                         approval_id.as_str(),
                         consumed_at_ms.0,
+                        action_id.as_str(),
+                        CONSUMED_APPROVAL_STATE,
                         revision.get() as i64,
                     ],
                 )
                 .map_err(db_error)?;
             if changed != 1 {
-                return Err(StateError::NotFound {
-                    target: target.clone(),
-                });
+                return Err(internal(InternalErrorCode::Invariant));
             }
             Ok(ObjectRevision {
                 target: target.clone(),
@@ -964,22 +1242,45 @@ fn apply_mutation(
             StateTarget::Session(_) | StateTarget::Outbox(_),
         ) => {
             let inbox_id = format!("inbox:{}:{}", source_label(*source), key.0.as_str());
-            transaction
-                .execute(
-                    "INSERT INTO inbox
-                         (inbox_id, source, inbox_key, digest, aggregate_sequence, received_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(source, inbox_key) DO NOTHING",
-                    params![
-                        inbox_id,
-                        json(source)?,
-                        json(key)?,
-                        digest.to_hex(),
-                        *aggregate_sequence as i64,
-                        txn.submitted_at_ms().0,
-                    ],
+            // LLD 153: a duplicate with the same digest is a no-op; the same
+            // key with a different digest is a conflict, never a silent drop.
+            // `inbox` rows carry no revision column, so the no-op receipt is
+            // the only representable revision (`INITIAL`), matching the
+            // stored row.
+            let stored: Option<String> = transaction
+                .query_row(
+                    "SELECT digest FROM inbox WHERE source = ?1 AND inbox_key = ?2",
+                    params![json(source)?, json(key)?],
+                    |row| row.get(0),
                 )
-                .map_err(|error| map_constraint(error, "inbox"))?;
+                .optional()
+                .map_err(db_error)?;
+            match stored {
+                Some(stored) if stored != digest.to_hex() => {
+                    return Err(StateError::ConstraintViolation {
+                        constraint: "inbox_digest",
+                    })
+                }
+                Some(_) => {}
+                None => {
+                    transaction
+                        .execute(
+                            "INSERT INTO inbox
+                                 (inbox_id, source, inbox_key, digest, aggregate_sequence,
+                                  received_at_ms)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                inbox_id,
+                                json(source)?,
+                                json(key)?,
+                                digest.to_hex(),
+                                *aggregate_sequence as i64,
+                                txn.submitted_at_ms().0,
+                            ],
+                        )
+                        .map_err(|error| map_constraint(error, "inbox"))?;
+                }
+            }
             Ok(ObjectRevision {
                 target: target.clone(),
                 revision: Revision::INITIAL,
@@ -1020,8 +1321,9 @@ fn require_revision(
     transaction: &Transaction<'_>,
     target: &StateTarget,
     expected: Option<Revision>,
+    generation: DaemonGeneration,
 ) -> Result<Revision, StateError> {
-    let current = stored_revision(transaction, target)?;
+    let current = stored_revision(transaction, target, generation)?;
     match expected {
         Some(expected) if expected != current => Err(StateError::Conflict {
             target: target.clone(),
@@ -1035,9 +1337,14 @@ fn require_revision(
 fn stored_revision(
     transaction: &Transaction<'_>,
     target: &StateTarget,
+    generation: DaemonGeneration,
 ) -> Result<Revision, StateError> {
     let (table, column, key) = match target {
-        StateTarget::DaemonGeneration => ("daemon_generations", "generation", "0".to_string()),
+        StateTarget::DaemonGeneration => (
+            "daemon_generations",
+            "generation",
+            generation.get().to_string(),
+        ),
         StateTarget::Attempt(id) => ("attempts", "attempt_id", id.as_str().to_string()),
         StateTarget::Dispatch(id) => ("dispatches", "dispatch_id", id.as_str().to_string()),
         StateTarget::Task(id) => ("tasks", "task_id", id.as_str().to_string()),
@@ -1056,9 +1363,6 @@ fn stored_revision(
             })
         }
     };
-    if target == &StateTarget::DaemonGeneration {
-        return Ok(Revision::INITIAL);
-    }
     let sql = format!("SELECT revision FROM {table} WHERE {column} = ?1");
     let revision: Option<i64> = transaction
         .query_row(&sql, params![key], |row| row.get(0))
@@ -1081,6 +1385,19 @@ fn process_record_id(target: &StateTarget) -> Result<&ProcessRecordId, StateErro
 // ---------------------------------------------------------------------------
 
 fn execute_query(connection: &Connection, query: StateQuery) -> Result<StateReply, StateError> {
+    // F6: a reader reply can be built from many SELECTs (`RecoveryView` reads
+    // nine tables). A DEFERRED read transaction pins one WAL snapshot so the
+    // reply cannot pair rows from different commits.
+    let snapshot = connection.unchecked_transaction().map_err(db_error)?;
+    let reply = execute_query_inner(&snapshot, query)?;
+    snapshot.commit().map_err(db_error)?;
+    Ok(reply)
+}
+
+fn execute_query_inner(
+    connection: &Connection,
+    query: StateQuery,
+) -> Result<StateReply, StateError> {
     match query {
         StateQuery::CurrentOwnership => {
             Ok(StateReply::CurrentOwnership(current_ownership(connection)?))
@@ -1577,10 +1894,11 @@ fn readiness_verdict(
 }
 
 fn outbox_view(connection: &Connection, outbox_id: &OutboxId) -> Result<OutboxView, StateError> {
-    let row: Option<(String, String, i64, String, String, Option<i64>)> = connection
+    type OutboxRow = (String, String, i64, String, String, Option<i64>, String);
+    let row: Option<OutboxRow> = connection
         .query_row(
             "SELECT outbox_id, destination, aggregate_sequence, outbox_key, payload_digest,
-                    last_observed_at_ms
+                    last_observed_at_ms, state
              FROM outbox WHERE outbox_id = ?1",
             params![outbox_id.as_str()],
             |row| {
@@ -1591,25 +1909,16 @@ fn outbox_view(connection: &Connection, outbox_id: &OutboxId) -> Result<OutboxVi
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .optional()
         .map_err(db_error)?;
-    let Some((id, destination, sequence, key, digest, observed)) = row else {
+    let Some((id, destination, sequence, key, digest, observed, stored_state)) = row else {
         return Err(StateError::NotFound {
             target: StateTarget::Outbox(outbox_id.clone()),
         });
-    };
-    let state: OutboxState = {
-        let stored: String = connection
-            .query_row(
-                "SELECT state FROM outbox WHERE outbox_id = ?1",
-                params![outbox_id.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(db_error)?;
-        parse_json(&stored)?
     };
     Ok(OutboxView {
         intent: OutboxIntent {
@@ -1618,7 +1927,7 @@ fn outbox_view(connection: &Connection, outbox_id: &OutboxId) -> Result<OutboxVi
             key: parse_json(&key)?,
             aggregate_sequence: sequence as u64,
             payload_digest: Sha256Digest::from_hex(&digest).map_err(|_| decode_error())?,
-            state,
+            state: parse_json(&stored_state)?,
         },
         last_observed_at: observed.map(UtcMillis),
     })
